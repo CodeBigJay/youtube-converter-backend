@@ -1,0 +1,6 @@
+com\codeBigJay\mediaconverter\model\ConversionStatus$State.class
+com\codeBigJay\mediaconverter\service\ConversionService.class
+com\codeBigJay\mediaconverter\controller\ConvertController.class
+com\codeBigJay\MediaConverterApplication.class
+com\codeBigJay\mediaconverter\util\FileUtil.class
+com\codeBigJay\mediaconverter\model\ConversionStatus.class
