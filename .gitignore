@@ -1,0 +1,11 @@
+target/ 
+.mvn/ 
+*.jar 
+*.war 
+*.ear 
+*.zip 
+*.tar.gz 
+*.rar 
+*.iml 
+.idea/ 
+*.log 
