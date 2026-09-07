@@ -16,6 +16,8 @@ import java.net.http.*;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.*;
@@ -152,10 +154,43 @@ public class ConversionService {
         return statusMap.get(id);
     }
 
+    /** Backward-compatible accessor: returns the first output file only. */
     public File getOutputFile(String id) {
         ConversionStatus st = statusMap.get(id);
         if (st == null || st.getState() != ConversionStatus.State.COMPLETED) return null;
         return new File(st.getOutputFilename());
+    }
+
+    /** Returns every file produced for this id (one for a single video, many for a playlist). */
+    public List<File> getOutputFiles(String id) {
+        ConversionStatus st = statusMap.get(id);
+        if (st == null || st.getState() != ConversionStatus.State.COMPLETED) return List.of();
+        List<File> files = new ArrayList<>();
+        for (String path : st.getOutputFilenames()) {
+            files.add(new File(path));
+        }
+        return files;
+    }
+
+    /**
+     * Zips all output files for this id into a single archive and returns it.
+     * Used when a playlist produced more than one file and the client wants one download.
+     */
+    public File zipOutputFiles(String id) throws IOException {
+        List<File> files = getOutputFiles(id);
+        if (files.isEmpty()) return null;
+        File zipFile = storageDir.resolve(id + "-playlist.zip").toFile();
+        try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(new FileOutputStream(zipFile))) {
+            for (File f : files) {
+                if (!f.exists()) continue;
+                zos.putNextEntry(new java.util.zip.ZipEntry(f.getName()));
+                try (FileInputStream fis = new FileInputStream(f)) {
+                    fis.transferTo(zos);
+                }
+                zos.closeEntry();
+            }
+        }
+        return zipFile;
     }
 
     private void downloadYouTubeVideo(URI uri, String id, ConversionStatus status) throws Exception {
@@ -163,10 +198,14 @@ public class ConversionService {
         status.setMessage("Downloading from YouTube...");
         logger.info("📥 [{}] Starting YouTube download: {}", id, uri.toString());
 
-        String sanitized = FileUtil.sanitizeFilename("youtube-audio");
-        Path tempInput = storageDir.resolve(id + "-" + sanitized);
+        // NOTE: the output template MUST contain something that varies per video
+        // (autonumber here) or, when the URL is a playlist, yt-dlp will happily
+        // download every item but each one will overwrite the same file on disk,
+        // leaving only the last video once the process exits.
+        String outTemplate = id + "-%(autonumber)03d-%(title).80s.%(ext)s";
 
-        // Use yt-dlp to download and convert YouTube video directly to MP3
+        // Use yt-dlp to download and convert YouTube video(s) directly to MP3.
+        // Works for a single video URL and for a playlist URL alike.
         ProcessBuilder pb = new ProcessBuilder(
                 "yt-dlp",
                 "-f", "bestaudio",  // Get best audio quality
@@ -175,7 +214,11 @@ public class ConversionService {
                 "--audio-quality", "0",   // Best quality
                 "--embed-thumbnail",      // Embed thumbnail in MP3
                 "--add-metadata",         // Add metadata
-                "-o", tempInput + ".%(ext)s",
+                "--yes-playlist",         // If the URL is a playlist, grab every item
+                "--ignore-errors",        // Don't abort the whole playlist over one bad video
+                "--restrict-filenames",   // Keep filenames filesystem/shell safe
+                "--autonumber-start", "1",
+                "-o", storageDir.resolve(outTemplate).toString(),
                 uri.toString()
         );
 
@@ -206,74 +249,56 @@ public class ConversionService {
 
         int rc = proc.waitFor();
         logger.info("📊 [{}] yt-dlp exit code: {}", id, rc);
-        
-        if (rc == 0) {
-            // Find the actual downloaded file
-            File downloadedFile = findDownloadedFile(tempInput);
-            if (downloadedFile != null && downloadedFile.exists()) {
-                status.setState(ConversionStatus.State.COMPLETED);
-                status.setProgressPercent(100);
-                status.setOutputFilename(downloadedFile.getAbsolutePath());
-                status.setMessage("YouTube conversion completed!");
-                logger.info("✅ [{}] YouTube conversion completed: {}", id, downloadedFile.getAbsolutePath());
-            } else {
-                // Try alternative file patterns
-                downloadedFile = findAlternativeFiles(id);
-                if (downloadedFile != null && downloadedFile.exists()) {
-                    status.setState(ConversionStatus.State.COMPLETED);
-                    status.setProgressPercent(100);
-                    status.setOutputFilename(downloadedFile.getAbsolutePath());
-                    status.setMessage("YouTube conversion completed!");
-                    logger.info("✅ [{}] YouTube conversion completed (alternative): {}", id, downloadedFile.getAbsolutePath());
-                } else {
-                    logger.error("❌ [{}] Downloaded files not found. Output: {}", id, output);
-                    throw new IOException("YouTube download completed but file not found. Check logs for details.");
-                }
+
+        // Collect every file yt-dlp produced for this conversion id, in download
+        // order (the autonumber prefix keeps them sorted). This is what makes
+        // playlists work: a single video yields one file, a playlist yields many.
+        List<File> downloadedFiles = findAllDownloadedFiles(id);
+
+        if (rc == 0 && !downloadedFiles.isEmpty()) {
+            status.setState(ConversionStatus.State.COMPLETED);
+            status.setProgressPercent(100);
+            for (File f : downloadedFiles) {
+                status.addOutputFilename(f.getAbsolutePath());
             }
+            if (downloadedFiles.size() == 1) {
+                status.setMessage("YouTube conversion completed!");
+            } else {
+                status.setMessage("Playlist conversion completed! " + downloadedFiles.size() + " files downloaded.");
+            }
+            logger.info("✅ [{}] YouTube conversion completed: {} file(s)", id, downloadedFiles.size());
+        } else if (!downloadedFiles.isEmpty()) {
+            // --ignore-errors can produce a non-zero rc even though some items
+            // in the playlist succeeded; surface what we got instead of failing outright.
+            status.setState(ConversionStatus.State.COMPLETED);
+            status.setProgressPercent(100);
+            for (File f : downloadedFiles) {
+                status.addOutputFilename(f.getAbsolutePath());
+            }
+            status.setMessage("Completed with some errors. " + downloadedFiles.size() + " file(s) downloaded. Some playlist items may have failed.");
+            logger.warn("⚠️ [{}] yt-dlp rc={} but {} file(s) were produced", id, rc, downloadedFiles.size());
         } else {
             logger.error("❌ [{}] yt-dlp failed. Output: {}", id, output);
             throw new IOException("YouTube download failed with code: " + rc + ". Check logs for details.");
         }
     }
 
-    private File findDownloadedFile(Path tempInput) {
-        String baseName = tempInput.toString();
-        File[] possibleFiles = new File[]{
-            new File(baseName + ".mp3"),
-            new File(baseName + ".m4a"),
-            new File(baseName + ".webm"),
-            new File(baseName + ".mp4")
-        };
-        
-        for (File file : possibleFiles) {
-            if (file.exists()) {
-                logger.debug("📁 Found downloaded file: {}", file.getAbsolutePath());
-                return file;
-            }
-        }
-        return null;
-    }
+    private static final java.util.Set<String> AUDIO_EXTENSIONS =
+            java.util.Set.of(".mp3", ".m4a", ".webm", ".mp4", ".opus", ".ogg");
 
-    private File findAlternativeFiles(String id) {
-        // Search for any files that start with the ID
+    /** Finds every file this conversion id produced, sorted so playlist order is preserved. */
+    private List<File> findAllDownloadedFiles(String id) {
         File storageDirFile = storageDir.toFile();
-        File[] files = storageDirFile.listFiles((dir, name) -> name.startsWith(id));
-        
-        if (files != null && files.length > 0) {
-            logger.debug("🔍 Found {} files with ID prefix: {}", files.length, id);
-            for (File file : files) {
-                logger.debug("📁 Checking file: {}", file.getName());
-                if (file.isFile() && (file.getName().endsWith(".mp3") || 
-                                      file.getName().endsWith(".m4a") || 
-                                      file.getName().endsWith(".webm") || 
-                                      file.getName().endsWith(".mp4"))) {
-                    return file;
-                }
-            }
-            // Return the first file found if no specific extension matches
-            return files[0];
+        String prefix = id + "-";
+        File[] files = storageDirFile.listFiles((dir, name) ->
+                name.startsWith(prefix) && AUDIO_EXTENSIONS.stream().anyMatch(ext -> name.toLowerCase().endsWith(ext)));
+
+        List<File> result = new ArrayList<>();
+        if (files != null) {
+            result.addAll(java.util.Arrays.asList(files));
+            result.sort(java.util.Comparator.comparing(File::getName));
         }
-        return null;
+        return result;
     }
 
     private void downloadAndConvert(URI uri, String id, ConversionStatus status) throws Exception {
